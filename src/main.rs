@@ -3,11 +3,15 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState,
+};
 use ratatui::Terminal;
 use ratatui::{backend::CrosstermBackend, Frame};
 use rustypipe::client::RustyPipe;
-use rustypipe::model::{VideoItem, YouTubeItem};
+use rustypipe::model::paginator::ContinuationEndpoint;
+use rustypipe::model::VideoItem;
 use rustypipe::param::search_filter::SearchFilter;
 use std::fs;
 use std::io;
@@ -42,7 +46,15 @@ struct App {
     query: String,
     cursor: usize,
     results: Vec<Video>,
+    page: usize,
+    selected_row: usize,
     selected: usize,
+    results_state: ListState,
+    search_ctoken: Option<String>,
+    search_visitor_data: Option<String>,
+    search_endpoint: Option<ContinuationEndpoint>,
+    loading_more: bool,
+    pending_next_page: bool,
     status: String,
     rx: Receiver<AppMsg>,
     tx: Sender<AppMsg>,
@@ -50,6 +62,15 @@ struct App {
     focus: Focus,
     thumb_area: Option<ratatui::layout::Rect>,
     last_thumb: Option<ThumbRender>,
+}
+
+const RESULTS_PER_PAGE: usize = 17;
+
+#[derive(Debug, Clone, Copy)]
+enum ResultsEntry {
+    PreviousPage,
+    NextPage,
+    Result(usize),
 }
 
 #[derive(Clone)]
@@ -65,11 +86,19 @@ enum Focus {
 }
 
 enum AppMsg {
-    Search(Result<Vec<Video>, String>),
+    Search(Result<SearchPage, String>),
+    MoreResults(Result<SearchPage, String>),
     Thumbnail {
         index: usize,
         result: Result<PathBuf, String>,
     },
+}
+
+struct SearchPage {
+    results: Vec<Video>,
+    ctoken: Option<String>,
+    visitor_data: Option<String>,
+    endpoint: ContinuationEndpoint,
 }
 
 fn main() -> io::Result<()> {
@@ -84,7 +113,15 @@ fn main() -> io::Result<()> {
         query: String::new(),
         cursor: 0,
         results: Vec::new(),
+        page: 1,
+        selected_row: 0,
         selected: 0,
+        results_state: ListState::default(),
+        search_ctoken: None,
+        search_visitor_data: None,
+        search_endpoint: None,
+        loading_more: false,
+        pending_next_page: false,
         status: "Type a query and press Enter.".to_string(),
         rx,
         tx,
@@ -122,8 +159,16 @@ fn main() -> io::Result<()> {
                     app.searching = false;
                     match result {
                         Ok(results) => {
-                            app.results = results;
+                            app.results = results.results;
+                            app.page = 1;
                             app.selected = 0;
+                            app.selected_row = 0;
+                            app.results_state = ListState::default();
+                            app.search_ctoken = results.ctoken;
+                            app.search_visitor_data = results.visitor_data;
+                            app.search_endpoint = Some(results.endpoint);
+                            app.loading_more = false;
+                            app.pending_next_page = false;
                             if !app.results.is_empty() {
                                 app.focus = Focus::Results;
                                 let selected = app.selected;
@@ -132,6 +177,37 @@ fn main() -> io::Result<()> {
                             app.status = format!("Found {} results.", app.results.len());
                         }
                         Err(err) => {
+                            app.status = err;
+                        }
+                    }
+                }
+                AppMsg::MoreResults(result) => {
+                    app.loading_more = false;
+                    match result {
+                        Ok(results) => {
+                            if results.results.is_empty() {
+                                app.pending_next_page = false;
+                                app.status = "No more results.".to_string();
+                            } else {
+                                app.results.extend(results.results);
+                                app.search_ctoken = results.ctoken;
+                                app.search_visitor_data = results.visitor_data;
+                                app.search_endpoint = Some(results.endpoint);
+                                if app.pending_next_page
+                                    && app.page < total_pages(app.results.len())
+                                {
+                                    app.page += 1;
+                                    app.selected_row = first_result_row(&app);
+                                    app.results_state = ListState::default();
+                                    sync_selected_result(&mut app);
+                                }
+                                app.pending_next_page = false;
+                                app.status =
+                                    format!("Found {} results.", app.results.len());
+                            }
+                        }
+                        Err(err) => {
+                            app.pending_next_page = false;
                             app.status = err;
                         }
                     }
@@ -180,19 +256,66 @@ fn handle_key(app: &mut App, key: KeyCode) -> io::Result<bool> {
                     }
                 }
                 Focus::Results => {
-                    if let Some(video) = app.results.get(app.selected) {
-                        play_video(video);
-                        app.status = format!("Playing: {}", video.title);
+                    let entries = results_entries(app);
+                    if entries.is_empty() {
+                        return Ok(false);
+                    }
+                    app.selected_row = app.selected_row.min(entries.len().saturating_sub(1));
+                    match entries[app.selected_row] {
+                        ResultsEntry::PreviousPage => {
+                            if app.page > 1 {
+                                app.page -= 1;
+                                app.selected_row = first_result_row(app);
+                                app.results_state = ListState::default();
+                                sync_selected_result(app);
+                            }
+                        }
+                        ResultsEntry::NextPage => {
+                            let loaded_pages = total_pages(app.results.len());
+                            if app.page < loaded_pages {
+                                app.page += 1;
+                                app.selected_row = first_result_row(app);
+                                app.results_state = ListState::default();
+                                sync_selected_result(app);
+                            } else if app.search_ctoken.is_some() && !app.loading_more {
+                                app.loading_more = true;
+                                app.pending_next_page = true;
+                                app.status = "Loading more results...".to_string();
+                                let tx = app.tx.clone();
+                                let ctoken = app.search_ctoken.clone().unwrap_or_default();
+                                let visitor = app.search_visitor_data.clone();
+                                let endpoint = app.search_endpoint.unwrap_or(ContinuationEndpoint::Search);
+                                thread::spawn(move || {
+                                    let result = if ctoken.is_empty() {
+                                        Err("No more results.".to_string())
+                                    } else {
+                                        search_rustypipe_continuation(
+                                            &ctoken,
+                                            visitor.as_deref(),
+                                            endpoint,
+                                        )
+                                    };
+                                    let _ = tx.send(AppMsg::MoreResults(result));
+                                });
+                            } else {
+                                app.status = "No more results.".to_string();
+                            }
+                        }
+                        ResultsEntry::Result(index) => {
+                            if let Some(video) = app.results.get(index) {
+                                play_video(video);
+                                app.status = format!("Playing: {}", video.title);
+                            }
+                        }
                     }
                 }
             }
         }
         KeyCode::Up => {
             if app.focus == Focus::Results {
-                if app.selected > 0 {
-                    app.selected -= 1;
-                    let selected = app.selected;
-                    queue_thumbnail(app, selected);
+                if app.selected_row > 0 {
+                    app.selected_row -= 1;
+                    sync_selected_result(app);
                 } else {
                     app.focus = Focus::Search;
                 }
@@ -203,15 +326,14 @@ fn handle_key(app: &mut App, key: KeyCode) -> io::Result<bool> {
                 Focus::Search => {
                     if !app.results.is_empty() {
                         app.focus = Focus::Results;
-                        let selected = app.selected;
-                        queue_thumbnail(app, selected);
+                        sync_selected_result(app);
                     }
                 }
                 Focus::Results => {
-                    if app.selected + 1 < app.results.len() {
-                        app.selected += 1;
-                        let selected = app.selected;
-                        queue_thumbnail(app, selected);
+                    let entries = results_entries(app);
+                    if app.selected_row + 1 < entries.len() {
+                        app.selected_row += 1;
+                        sync_selected_result(app);
                     }
                 }
             }
@@ -246,6 +368,63 @@ fn handle_key(app: &mut App, key: KeyCode) -> io::Result<bool> {
     Ok(false)
 }
 
+fn total_pages(result_count: usize) -> usize {
+    if result_count == 0 {
+        1
+    } else {
+        (result_count + RESULTS_PER_PAGE - 1) / RESULTS_PER_PAGE
+    }
+}
+
+fn first_result_row(app: &App) -> usize {
+    if app.page > 1 {
+        1
+    } else {
+        0
+    }
+}
+
+fn results_entries(app: &App) -> Vec<ResultsEntry> {
+    let total = total_pages(app.results.len());
+    if app.results.is_empty() {
+        return Vec::new();
+    }
+
+    let page = app.page.clamp(1, total);
+    let start = (page - 1) * RESULTS_PER_PAGE;
+    let end = (start + RESULTS_PER_PAGE).min(app.results.len());
+    let mut entries = Vec::new();
+    let has_more = app.search_ctoken.is_some() || app.loading_more;
+
+    if page > 1 {
+        entries.push(ResultsEntry::PreviousPage);
+    }
+
+    for index in start..end {
+        entries.push(ResultsEntry::Result(index));
+    }
+
+    if page > 1 || page < total || has_more {
+        entries.push(ResultsEntry::NextPage);
+    }
+
+    entries
+}
+
+fn sync_selected_result(app: &mut App) {
+    let entries = results_entries(app);
+    if entries.is_empty() {
+        return;
+    }
+    app.selected_row = app.selected_row.min(entries.len().saturating_sub(1));
+    if let ResultsEntry::Result(index) = entries[app.selected_row] {
+        if app.selected != index {
+            app.selected = index;
+            queue_thumbnail(app, index);
+        }
+    }
+}
+
 fn ui(f: &mut Frame<'_>, app: &mut App) {
     let size = f.size();
 
@@ -271,10 +450,10 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
                     format!("Length: {duration}"),
                     Style::default().fg(Color::Green),
                 )),
-            Line::from(Span::styled(
-                format!("Uploaded by {uploader}"),
-                Style::default().fg(Color::Blue),
-            )),
+                Line::from(Span::styled(
+                    format!("Uploaded by {uploader}"),
+                    Style::default().fg(Color::Blue),
+                )),
                 Line::from(Span::styled(
                     published,
                     Style::default().fg(Color::LightMagenta),
@@ -317,21 +496,6 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         }
     }
 
-    let items: Vec<ListItem> = app
-        .results
-        .iter()
-        .enumerate()
-        .map(|(i, video)| {
-            let mut style = Style::default();
-            if i == app.selected {
-                if app.focus == Focus::Results {
-                    style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
-                }
-            }
-            ListItem::new(Line::from(Span::styled(video.title.clone(), style)))
-        })
-        .collect();
-
     let results_title = "Results";
     let results_block = Block::default()
         .borders(Borders::ALL)
@@ -340,8 +504,70 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
             Focus::Results => Style::default().fg(Color::Cyan),
             Focus::Search => Style::default(),
         });
-    let results = List::new(items).block(results_block);
-    f.render_widget(results, chunks[1]);
+    f.render_widget(results_block.clone(), chunks[1]);
+
+    let entries = results_entries(app);
+    let items: Vec<ListItem> = entries
+        .iter()
+        .map(|entry| match *entry {
+            ResultsEntry::PreviousPage => ListItem::new(Line::from(Span::styled(
+                "Previous Page",
+                Style::default().fg(Color::Cyan),
+            ))),
+            ResultsEntry::NextPage => ListItem::new(Line::from(Span::styled(
+                "Next Page",
+                Style::default().fg(Color::Cyan),
+            ))),
+            ResultsEntry::Result(index) => {
+                let title = app
+                    .results
+                    .get(index)
+                    .map(|video| video.title.clone())
+                    .unwrap_or_else(|| "-".to_string());
+                ListItem::new(Line::from(Span::raw(title)))
+            }
+        })
+        .collect();
+
+    if entries.is_empty() {
+        app.results_state.select(None);
+        *app.results_state.offset_mut() = 0;
+    } else {
+        app.selected_row = app.selected_row.min(entries.len().saturating_sub(1));
+        app.results_state.select(Some(app.selected_row));
+    }
+
+    let inner = results_block.inner(chunks[1]);
+    let show_scrollbar = inner.height > 0 && items.len() > inner.height as usize;
+    let (list_area, scrollbar_area) = if show_scrollbar && inner.width > 1 {
+        (
+            ratatui::layout::Rect::new(inner.x, inner.y, inner.width - 1, inner.height),
+            Some(ratatui::layout::Rect::new(
+                inner.x + inner.width - 1,
+                inner.y,
+                1,
+                inner.height,
+            )),
+        )
+    } else {
+        (inner, None)
+    };
+
+    let highlight_style = if app.focus == Focus::Results {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let results = List::new(items).highlight_style(highlight_style);
+    f.render_stateful_widget(results, list_area, &mut app.results_state);
+
+    if let Some(scrollbar_area) = scrollbar_area {
+        let mut scrollbar_state = ScrollbarState::new(entries.len())
+            .position(app.results_state.offset())
+            .viewport_content_length(list_area.height as usize);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+        f.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+    }
 
     let preview_block = Block::default().borders(Borders::ALL).title("Details");
     let preview_inner = preview_block.inner(chunks[2]);
@@ -385,31 +611,90 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
 
 }
 
-fn search_rustypipe(query: &str) -> Result<Vec<Video>, String> {
+fn search_rustypipe(query: &str) -> Result<SearchPage, String> {
     let client = rustypipe_client();
     let runtime = RUNTIME.get_or_init(|| {
         tokio::runtime::Runtime::new().expect("Failed to create tokio runtime")
     });
 
-    let result = runtime.block_on(
-        client
-            .query()
-            .search_filter(query.to_string(), &SearchFilter::new()),
-    );
+    let result = runtime.block_on(client.query().search_filter::<VideoItem, _>(
+        query.to_string(),
+        &SearchFilter::new(),
+    ));
 
     let response = match result {
         Ok(response) => response,
         Err(err) => return Err(format!("RustyPipe search failed: {err}")),
     };
 
+    let paginator = response.items;
     let mut results = Vec::new();
-    for item in response.items.items {
-        if let YouTubeItem::Video(video) = item {
-            results.push(video_item_to_video(video));
+    for item in paginator.items {
+        results.push(video_item_to_video(item));
+    }
+
+    Ok(SearchPage {
+        results,
+        ctoken: paginator.ctoken,
+        visitor_data: paginator.visitor_data,
+        endpoint: paginator.endpoint,
+    })
+}
+
+fn search_rustypipe_continuation(
+    ctoken: &str,
+    visitor_data: Option<&str>,
+    endpoint: ContinuationEndpoint,
+) -> Result<SearchPage, String> {
+    let client = rustypipe_client();
+    let runtime = RUNTIME.get_or_init(|| {
+        tokio::runtime::Runtime::new().expect("Failed to create tokio runtime")
+    });
+
+    let mut results = Vec::new();
+    let mut next_ctoken = if ctoken.is_empty() {
+        None
+    } else {
+        Some(ctoken.to_string())
+    };
+    let mut next_visitor = visitor_data.map(str::to_string);
+    let mut next_endpoint = endpoint;
+    let mut pages_fetched = 0usize;
+
+    while results.len() < RESULTS_PER_PAGE {
+        let Some(token) = next_ctoken.clone() else {
+            break;
+        };
+        let result = runtime.block_on(
+            client
+                .query()
+                .continuation::<VideoItem, _>(token, next_endpoint, next_visitor.as_deref()),
+        );
+
+        let paginator = match result {
+            Ok(paginator) => paginator,
+            Err(err) => return Err(format!("RustyPipe continuation failed: {err}")),
+        };
+
+        for item in paginator.items {
+            results.push(video_item_to_video(item));
+        }
+
+        next_ctoken = paginator.ctoken;
+        next_visitor = paginator.visitor_data;
+        next_endpoint = paginator.endpoint;
+        pages_fetched += 1;
+        if pages_fetched >= 3 {
+            break;
         }
     }
 
-    Ok(results)
+    Ok(SearchPage {
+        results,
+        ctoken: next_ctoken,
+        visitor_data: next_visitor,
+        endpoint: next_endpoint,
+    })
 }
 
 fn play_video(video: &Video) {

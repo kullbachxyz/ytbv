@@ -273,11 +273,12 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         ])
         .split(size);
 
-    let search_title = match app.focus {
-        Focus::Search => "Search [active]",
-        Focus::Results => "Search",
-    };
+    let search_title = "Search";
     let search_block = Block::default().borders(Borders::ALL).title(search_title);
+    let search_block = search_block.border_style(match app.focus {
+        Focus::Search => Style::default().fg(Color::Cyan),
+        Focus::Results => Style::default(),
+    });
     let search = Paragraph::new(app.query.as_str()).block(search_block.clone());
     f.render_widget(search, chunks[0]);
     if app.focus == Focus::Search {
@@ -296,18 +297,23 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         .map(|(i, video)| {
             let mut style = Style::default();
             if i == app.selected {
-                style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+                if app.focus == Focus::Results {
+                    style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+                }
             }
             ListItem::new(Line::from(Span::styled(video.title.clone(), style)))
         })
         .collect();
 
-    let results_title = match app.focus {
-        Focus::Search => "Results",
-        Focus::Results => "Results [active]",
-    };
-    let results =
-        List::new(items).block(Block::default().borders(Borders::ALL).title(results_title));
+    let results_title = "Results";
+    let results_block = Block::default()
+        .borders(Borders::ALL)
+        .title(results_title)
+        .border_style(match app.focus {
+            Focus::Results => Style::default().fg(Color::Cyan),
+            Focus::Search => Style::default(),
+        });
+    let results = List::new(items).block(results_block);
     f.render_widget(results, chunks[1]);
 
     let preview_block = Block::default().borders(Borders::ALL).title("Preview");

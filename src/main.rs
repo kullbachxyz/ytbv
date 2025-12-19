@@ -36,6 +36,7 @@ struct Video {
 
 struct App {
     query: String,
+    cursor: usize,
     results: Vec<Video>,
     selected: usize,
     status: String,
@@ -44,6 +45,13 @@ struct App {
     searching: bool,
     focus: Focus,
     thumb_area: Option<ratatui::layout::Rect>,
+    last_thumb: Option<ThumbRender>,
+}
+
+#[derive(Clone)]
+struct ThumbRender {
+    path: PathBuf,
+    area: ratatui::layout::Rect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +78,7 @@ fn main() -> io::Result<()> {
     let (tx, rx) = mpsc::channel();
     let mut app = App {
         query: String::new(),
+        cursor: 0,
         results: Vec::new(),
         selected: 0,
         status: "Type a query and press Enter.".to_string(),
@@ -78,6 +87,7 @@ fn main() -> io::Result<()> {
         searching: false,
         focus: Focus::Search,
         thumb_area: None,
+        last_thumb: None,
     };
 
     let mut last_tick = Instant::now();
@@ -85,7 +95,7 @@ fn main() -> io::Result<()> {
 
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
-        render_thumbnail(&app)?;
+        render_thumbnail(&mut app)?;
 
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
@@ -204,12 +214,26 @@ fn handle_key(app: &mut App, key: KeyCode) -> io::Result<bool> {
         }
         KeyCode::Backspace => {
             if app.focus == Focus::Search {
-                app.query.pop();
+                if app.cursor > 0 {
+                    app.cursor -= 1;
+                    app.query.remove(app.cursor);
+                }
+            }
+        }
+        KeyCode::Left => {
+            if app.focus == Focus::Search && app.cursor > 0 {
+                app.cursor -= 1;
+            }
+        }
+        KeyCode::Right => {
+            if app.focus == Focus::Search && app.cursor < app.query.chars().count() {
+                app.cursor += 1;
             }
         }
         KeyCode::Char(c) => {
             if app.focus == Focus::Search {
-                app.query.push(c);
+                app.query.insert(app.cursor, c);
+                app.cursor += 1;
             }
         }
         _ => {}
@@ -253,9 +277,17 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         Focus::Search => "Search [active]",
         Focus::Results => "Search",
     };
-    let search = Paragraph::new(app.query.as_str())
-        .block(Block::default().borders(Borders::ALL).title(search_title));
+    let search_block = Block::default().borders(Borders::ALL).title(search_title);
+    let search = Paragraph::new(app.query.as_str()).block(search_block.clone());
     f.render_widget(search, chunks[0]);
+    if app.focus == Focus::Search {
+        let inner = search_block.inner(chunks[0]);
+        if inner.width > 0 {
+            let cursor_x = inner.x + app.cursor as u16;
+            let cursor_x = cursor_x.min(inner.x + inner.width.saturating_sub(1));
+            f.set_cursor(cursor_x, inner.y);
+        }
+    }
 
     let items: Vec<ListItem> = app
         .results
@@ -379,21 +411,36 @@ fn queue_thumbnail(app: &mut App, index: usize) {
     }
 }
 
-fn render_thumbnail(app: &App) -> io::Result<()> {
+fn render_thumbnail(app: &mut App) -> io::Result<()> {
     let area = match app.thumb_area {
         Some(area) => area,
-        None => return Ok(()),
+        None => {
+            app.last_thumb = None;
+            return Ok(());
+        }
     };
 
     let video = match app.results.get(app.selected) {
         Some(video) => video,
-        None => return Ok(()),
+        None => {
+            app.last_thumb = None;
+            return Ok(());
+        }
     };
 
     let path = match &video.thumbnail_path {
         Some(path) => path,
-        None => return Ok(()),
+        None => {
+            app.last_thumb = None;
+            return Ok(());
+        }
     };
+
+    if let Some(last) = app.last_thumb.as_ref() {
+        if last.path == *path && last.area == area {
+            return Ok(());
+        }
+    }
 
     let config = ViuerConfig {
         x: area.x,
@@ -405,6 +452,10 @@ fn render_thumbnail(app: &App) -> io::Result<()> {
     };
 
     let _ = viuer::print_from_file(path, &config);
+    app.last_thumb = Some(ThumbRender {
+        path: path.clone(),
+        area,
+    });
     Ok(())
 }
 

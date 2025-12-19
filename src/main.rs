@@ -17,6 +17,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
+use time::{format_description, OffsetDateTime};
 use viuer::Config as ViuerConfig;
 
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -28,6 +29,9 @@ struct Video {
     url: String,
     channel: Option<String>,
     duration: Option<u64>,
+    view_count: Option<u64>,
+    publish_date: Option<OffsetDateTime>,
+    publish_date_txt: Option<String>,
     thumbnail_url: Option<String>,
     thumbnail_path: Option<PathBuf>,
     thumbnail_size: Option<(u32, u32)>,
@@ -247,11 +251,34 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
 
     let (preview, _) = match app.results.get(app.selected) {
         Some(video) => {
+            let views = video
+                .view_count
+                .map(format_views)
+                .unwrap_or_else(|| "- views".to_string());
+            let duration = video
+                .duration
+                .map(format_duration)
+                .unwrap_or_else(|| "-".to_string());
+            let uploader = video.channel.clone().unwrap_or_else(|| "-".to_string());
+            let published = format_published(video.publish_date_txt.as_deref(), video.publish_date);
             let lines = vec![
-                Line::from(vec![Span::styled("Title: ", Style::default().add_modifier(Modifier::BOLD)), Span::raw(&video.title)]),
-                Line::from(vec![Span::styled("Channel: ", Style::default().add_modifier(Modifier::BOLD)), Span::raw(video.channel.clone().unwrap_or_else(|| "-".to_string()))]),
-                Line::from(vec![Span::styled("Duration: ", Style::default().add_modifier(Modifier::BOLD)), Span::raw(video.duration.map(format_duration).unwrap_or_else(|| "-".to_string()))]),
-                Line::from(vec![Span::styled("URL: ", Style::default().add_modifier(Modifier::BOLD)), Span::raw(&video.url)]),
+                Line::from(Span::styled(
+                    &video.title,
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(views, Style::default().fg(Color::Yellow))),
+                Line::from(Span::styled(
+                    format!("Length: {duration}"),
+                    Style::default().fg(Color::Green),
+                )),
+            Line::from(Span::styled(
+                format!("Uploaded by {uploader}"),
+                Style::default().fg(Color::Blue),
+            )),
+                Line::from(Span::styled(
+                    published,
+                    Style::default().fg(Color::LightMagenta),
+                )),
             ];
             (Paragraph::new(lines.clone()), lines.len())
         }
@@ -316,7 +343,7 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     let results = List::new(items).block(results_block);
     f.render_widget(results, chunks[1]);
 
-    let preview_block = Block::default().borders(Borders::ALL).title("Preview");
+    let preview_block = Block::default().borders(Borders::ALL).title("Details");
     let preview_inner = preview_block.inner(chunks[2]);
     f.render_widget(preview_block, chunks[2]);
 
@@ -495,6 +522,9 @@ fn video_item_to_video(video: VideoItem) -> Video {
         url: format!("https://www.youtube.com/watch?v={}", video.id),
         channel,
         duration: video.duration.map(u64::from),
+        view_count: video.view_count,
+        publish_date: video.publish_date,
+        publish_date_txt: video.publish_date_txt,
         thumbnail_url,
         thumbnail_path: None,
         thumbnail_size: None,
@@ -548,6 +578,41 @@ fn format_duration(secs: u64) -> String {
     let minutes = secs / 60;
     let seconds = secs % 60;
     format!("{minutes:02}:{seconds:02}")
+}
+
+fn format_views(views: u64) -> String {
+    let (value, suffix) = if views >= 1_000_000_000 {
+        (views as f64 / 1_000_000_000.0, "B")
+    } else if views >= 1_000_000 {
+        (views as f64 / 1_000_000.0, "M")
+    } else if views >= 1_000 {
+        (views as f64 / 1_000.0, "K")
+    } else {
+        return format!("{views} views");
+    };
+
+    let mut s = format!("{value:.2}");
+    while s.ends_with('0') {
+        s.pop();
+    }
+    if s.ends_with('.') {
+        s.pop();
+    }
+    format!("{s}{suffix} views")
+}
+
+fn format_published(relative: Option<&str>, date: Option<OffsetDateTime>) -> String {
+    let absolute = date.and_then(|d| {
+        let format = format_description::parse("[day]/[month]/[year]").ok()?;
+        d.format(&format).ok()
+    });
+
+    match (relative, absolute) {
+        (Some(rel), Some(abs)) => format!("Published {rel} [{abs}]"),
+        (Some(rel), None) => format!("Published {rel}"),
+        (None, Some(abs)) => format!("Published [{abs}]"),
+        (None, None) => "Published -".to_string(),
+    }
 }
 
 fn fit_dimensions_cells(

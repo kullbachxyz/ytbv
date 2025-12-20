@@ -13,6 +13,7 @@ use rustypipe::client::RustyPipe;
 use rustypipe::model::paginator::ContinuationEndpoint;
 use rustypipe::model::VideoItem;
 use rustypipe::param::search_filter::SearchFilter;
+use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -303,8 +304,14 @@ fn handle_key(app: &mut App, key: KeyCode) -> io::Result<bool> {
                         }
                         ResultsEntry::Result(index) => {
                             if let Some(video) = app.results.get(index) {
-                                play_video(video);
-                                app.status = format!("Playing: {}", video.title);
+                                match play_video(video) {
+                                    Ok(()) => {
+                                        app.status = format!("Playing: {}", video.title);
+                                    }
+                                    Err(err) => {
+                                        app.status = err;
+                                    }
+                                }
                             }
                         }
                     }
@@ -697,8 +704,10 @@ fn search_rustypipe_continuation(
     })
 }
 
-fn play_video(video: &Video) {
-    let _ = Command::new("mpv")
+fn play_video(video: &Video) -> Result<(), String> {
+    let mpv_bin = env::var("YTBV_MPV").unwrap_or_else(|_| "mpv".to_string());
+
+    Command::new(&mpv_bin)
         .args([
             "--ytdl-format=bestvideo[height<=1080]+bestaudio/best",
             &video.url,
@@ -706,7 +715,9 @@ fn play_video(video: &Video) {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("Failed to start mpv ('{mpv_bin}'): {err}"))
 }
 
 fn queue_thumbnail(app: &mut App, index: usize) {

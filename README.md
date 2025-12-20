@@ -45,7 +45,34 @@ Fast YouTube terminal UI prototype (alpha). Rust + ratatui + mpv.
 ## Requirements
 
 - Rust toolchain (`cargo`, `rustc`)
-- `mpv` on PATH
+- `mpv` on PATH (set `YTBV_MPV=/path/to/mpv` if it's not on PATH, e.g. app bundle)
+
+### macOS build notes (sixel support)
+
+`viuer`/`sixel` needs native image libs present. On macOS install and export paths before building:
+
+```bash
+brew install libsixel jpeg libpng giflib
+export PKG_CONFIG_PATH="/opt/homebrew/lib/pkgconfig:${PKG_CONFIG_PATH}"
+export CPATH="/opt/homebrew/include:${CPATH}"
+export LIBRARY_PATH="/opt/homebrew/lib:${LIBRARY_PATH}"
+# If a previous build failed on sixel-sys, clear it:
+cargo clean -p sixel-sys
+```
+
+### macOS playback notes (mpv + yt-dlp)
+
+- Install mpv + yt-dlp (Homebrew): `brew install mpv yt-dlp` (or `brew install --cask mpv` for the app bundle).
+- If using the .app bundle, point ytbv at it and ensure mpv sees Homebrew’s PATH/yt-dlp. The usual setup is:
+
+```bash
+export PATH="/opt/homebrew/bin:$PATH"
+export YTBV_MPV=/Applications/mpv.app/Contents/MacOS/mpv
+# Optionally force mpv to use a specific yt-dlp path:
+export YTBV_MPV_OPTS="--script-opts=ytdl_hook-ytdl_path=/opt/homebrew/bin/yt-dlp"
+```
+
+If your shell already has Homebrew’s PATH and mpv finds yt-dlp, the extra options are not needed.
 
 ## Build & Run
 

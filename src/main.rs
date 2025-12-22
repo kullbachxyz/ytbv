@@ -346,19 +346,11 @@ fn handle_key(app: &mut App, key: KeyCode) -> io::Result<bool> {
                 if app.selected_row > 0 {
                     app.selected_row -= 1;
                     sync_selected_result(app);
-                } else {
-                    app.focus = Focus::Search;
                 }
             }
         }
         KeyCode::Down => {
             match app.focus {
-                Focus::Search => {
-                    if !app.results.is_empty() {
-                        app.focus = Focus::Results;
-                        sync_selected_result(app);
-                    }
-                }
                 Focus::Results => {
                     let entries = results_entries(app);
                     if app.selected_row + 1 < entries.len() {
@@ -367,6 +359,7 @@ fn handle_key(app: &mut App, key: KeyCode) -> io::Result<bool> {
                     }
                 }
                 Focus::Details => {}
+                Focus::Search => {}
             }
         }
         KeyCode::Backspace => {

@@ -628,6 +628,18 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         (inner, None)
     };
 
+    let viewport_len = list_area.height as usize;
+    if viewport_len > 0 {
+        let mut offset = app.results_state.offset();
+        if app.selected_row < offset {
+            offset = app.selected_row;
+        } else if app.selected_row >= offset + viewport_len {
+            offset = app.selected_row + 1 - viewport_len;
+        }
+        let max_offset = entries.len().saturating_sub(viewport_len);
+        *app.results_state.offset_mut() = offset.min(max_offset);
+    }
+
     let highlight_style = if app.focus == Focus::Results {
         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
     } else {
@@ -637,8 +649,9 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     f.render_stateful_widget(results, list_area, &mut app.results_state);
 
     if let Some(scrollbar_area) = scrollbar_area {
+        let scroll_pos = app.selected_row.min(entries.len().saturating_sub(1));
         let mut scrollbar_state = ScrollbarState::new(entries.len())
-            .position(app.results_state.offset())
+            .position(scroll_pos)
             .viewport_content_length(list_area.height as usize);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
         f.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);

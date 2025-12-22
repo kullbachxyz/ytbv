@@ -80,6 +80,14 @@ If your shell already has Homebrew’s PATH and mpv finds yt-dlp, the extra opti
 cargo build
 cargo run
 ```
+## Building from Source
+
+```bash
+git clone https://github.com/kullbachxyz/ytbv
+cd oxwm
+cargo build --release
+sudo cp target/release/oxwm /usr/local/bin/
+```
 
 ## Next Steps
 

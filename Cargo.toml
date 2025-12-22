@@ -3,7 +3,9 @@ name = "ytbv"
 version = "0.2.0"
 edition = "2021"
 
-authors = ["kullbachxyz"]
+[[bin]]
+name = "ytbv"
+path = "src/main.rs"
 
 [dependencies]
 ratatui = "0.26"

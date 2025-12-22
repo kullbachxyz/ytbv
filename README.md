@@ -84,9 +84,9 @@ cargo run
 
 ```bash
 git clone https://github.com/kullbachxyz/ytbv
-cd oxwm
+cd ytbv
 cargo build --release
-sudo cp target/release/oxwm /usr/local/bin/
+sudo cp target/release/ytbv /usr/local/bin/
 ```
 
 ## Next Steps

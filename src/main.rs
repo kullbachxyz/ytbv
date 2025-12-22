@@ -242,6 +242,17 @@ fn main() -> io::Result<()> {
 fn handle_key(app: &mut App, key: KeyCode) -> io::Result<bool> {
     match key {
         KeyCode::Char('q') => return Ok(true),
+        KeyCode::Tab | KeyCode::BackTab => {
+            app.focus = match app.focus {
+                Focus::Search => {
+                    if !app.results.is_empty() {
+                        sync_selected_result(app);
+                    }
+                    Focus::Results
+                }
+                Focus::Results => Focus::Search,
+            };
+        }
         KeyCode::Enter => {
             match app.focus {
                 Focus::Search => {
@@ -483,6 +494,7 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
             Constraint::Length(3),
             Constraint::Min(0),
             Constraint::Length(preview_height),
+            Constraint::Length(1),
         ])
         .split(size);
 
@@ -616,6 +628,18 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     app.thumb_area = thumb_area;
     f.render_widget(preview, text_area);
 
+    let controls = Line::from(vec![
+        Span::styled(" ↑/↓ ", Style::default().fg(Color::Cyan)),
+        Span::raw("Navigate "),
+        Span::styled(" ⏎ ", Style::default().fg(Color::Cyan)),
+        Span::raw("Select/Play "),
+        Span::styled(" ↹ ", Style::default().fg(Color::Cyan)),
+        Span::raw("Switch "),
+        Span::styled(" q ", Style::default().fg(Color::Cyan)),
+        Span::raw("Quit"),
+    ]);
+    let controls_bar = Paragraph::new(controls);
+    f.render_widget(controls_bar, chunks[3]);
 }
 
 fn search_rustypipe(query: &str) -> Result<SearchPage, String> {

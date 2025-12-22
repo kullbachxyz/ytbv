@@ -12,7 +12,7 @@ use ratatui::{backend::CrosstermBackend, Frame};
 use rustypipe::client::RustyPipe;
 use rustypipe::model::paginator::ContinuationEndpoint;
 use rustypipe::model::VideoItem;
-use rustypipe::param::search_filter::SearchFilter;
+use rustypipe::param::{search_filter::SearchFilter, ChannelOrder};
 use std::env;
 use std::fs;
 use std::io;
@@ -33,6 +33,7 @@ struct Video {
     title: String,
     url: String,
     channel: Option<String>,
+    channel_id: Option<String>,
     duration: Option<u64>,
     view_count: Option<u64>,
     publish_date: Option<OffsetDateTime>,
@@ -84,6 +85,7 @@ struct ThumbRender {
 enum Focus {
     Search,
     Results,
+    Details,
 }
 
 enum AppMsg {
@@ -245,27 +247,22 @@ fn handle_key(app: &mut App, key: KeyCode) -> io::Result<bool> {
         KeyCode::Tab | KeyCode::BackTab => {
             app.focus = match app.focus {
                 Focus::Search => {
-                    if !app.results.is_empty() {
+                    if app.results.is_empty() {
+                        Focus::Search
+                    } else {
                         sync_selected_result(app);
+                        Focus::Results
                     }
-                    Focus::Results
                 }
-                Focus::Results => Focus::Search,
+                Focus::Results => Focus::Details,
+                Focus::Details => Focus::Search,
             };
         }
         KeyCode::Enter => {
             match app.focus {
                 Focus::Search => {
                     let query = app.query.trim().to_string();
-                    if !query.is_empty() && !app.searching {
-                        app.searching = true;
-                        app.status = format!("Searching for '{query}'...");
-                        let tx = app.tx.clone();
-                        thread::spawn(move || {
-                            let result = search_rustypipe(&query);
-                            let _ = tx.send(AppMsg::Search(result));
-                        });
-                    }
+                    start_search(app, query);
                 }
                 Focus::Results => {
                     let entries = results_entries(app);
@@ -327,6 +324,7 @@ fn handle_key(app: &mut App, key: KeyCode) -> io::Result<bool> {
                         }
                     }
                 }
+                Focus::Details => {}
             }
         }
         KeyCode::Up => {
@@ -354,6 +352,7 @@ fn handle_key(app: &mut App, key: KeyCode) -> io::Result<bool> {
                         sync_selected_result(app);
                     }
                 }
+                Focus::Details => {}
             }
         }
         KeyCode::Backspace => {
@@ -378,6 +377,18 @@ fn handle_key(app: &mut App, key: KeyCode) -> io::Result<bool> {
             if app.focus == Focus::Search {
                 app.query.insert(app.cursor, c);
                 app.cursor += 1;
+            } else if c == 'c' && app.focus == Focus::Details {
+                if let Some(video) = app.results.get(app.selected) {
+                    if let Some(channel_id) = video.channel_id.clone() {
+                        let channel_name =
+                            video.channel.clone().unwrap_or_else(|| "Channel".to_string());
+                        app.query = channel_name.clone();
+                        app.cursor = app.query.chars().count();
+                        start_channel_videos(app, channel_id, channel_name);
+                    } else {
+                        app.status = "No channel info for this video.".to_string();
+                    }
+                }
             }
         }
         _ => {}
@@ -443,6 +454,32 @@ fn sync_selected_result(app: &mut App) {
     }
 }
 
+fn start_search(app: &mut App, query: String) {
+    if query.is_empty() || app.searching {
+        return;
+    }
+    app.searching = true;
+    app.status = format!("Searching for '{query}'...");
+    let tx = app.tx.clone();
+    thread::spawn(move || {
+        let result = search_rustypipe(&query);
+        let _ = tx.send(AppMsg::Search(result));
+    });
+}
+
+fn start_channel_videos(app: &mut App, channel_id: String, channel_name: String) {
+    if app.searching {
+        return;
+    }
+    app.searching = true;
+    app.status = format!("Loading channel videos for '{channel_name}'...");
+    let tx = app.tx.clone();
+    thread::spawn(move || {
+        let result = channel_videos_latest(&channel_id);
+        let _ = tx.send(AppMsg::Search(result));
+    });
+}
+
 fn ui(f: &mut Frame<'_>, app: &mut App) {
     let size = f.size();
 
@@ -502,7 +539,7 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     let search_block = Block::default().borders(Borders::ALL).title(search_title);
     let search_block = search_block.border_style(match app.focus {
         Focus::Search => Style::default().fg(Color::Cyan),
-        Focus::Results => Style::default(),
+        Focus::Results | Focus::Details => Style::default(),
     });
     let search = Paragraph::new(app.query.as_str()).block(search_block.clone());
     f.render_widget(search, chunks[0]);
@@ -521,7 +558,7 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         .title(results_title)
         .border_style(match app.focus {
             Focus::Results => Style::default().fg(Color::Cyan),
-            Focus::Search => Style::default(),
+            Focus::Search | Focus::Details => Style::default(),
         });
     f.render_widget(results_block.clone(), chunks[1]);
 
@@ -588,7 +625,13 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         f.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
     }
 
-    let preview_block = Block::default().borders(Borders::ALL).title("Details");
+    let preview_block = Block::default()
+        .borders(Borders::ALL)
+        .title("Details")
+        .border_style(match app.focus {
+            Focus::Details => Style::default().fg(Color::Cyan),
+            Focus::Search | Focus::Results => Style::default(),
+        });
     let preview_inner = preview_block.inner(chunks[2]);
     f.render_widget(preview_block, chunks[2]);
 
@@ -628,16 +671,20 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     app.thumb_area = thumb_area;
     f.render_widget(preview, text_area);
 
-    let controls = Line::from(vec![
-        Span::styled(" ↑/↓ ", Style::default().fg(Color::Cyan)),
-        Span::raw("Navigate "),
-        Span::styled(" ⏎ ", Style::default().fg(Color::Cyan)),
-        Span::raw("Select/Play "),
-        Span::styled(" ↹ ", Style::default().fg(Color::Cyan)),
-        Span::raw("Switch "),
-        Span::styled(" q ", Style::default().fg(Color::Cyan)),
-        Span::raw("Quit"),
-    ]);
+    let mut controls = vec![];
+    if app.focus == Focus::Results {
+        controls.push(Span::styled(" ⏎ ", Style::default().fg(Color::Cyan)));
+        controls.push(Span::raw("Select/Play "));
+    }
+    if app.focus == Focus::Details {
+        controls.push(Span::styled(" c ", Style::default().fg(Color::Cyan)));
+        controls.push(Span::raw("Channel videos "));
+    }
+    controls.push(Span::styled(" ↹ ", Style::default().fg(Color::Cyan)));
+    controls.push(Span::raw("Switch "));
+    controls.push(Span::styled(" q ", Style::default().fg(Color::Cyan)));
+    controls.push(Span::raw("Quit"));
+    let controls = Line::from(controls);
     let controls_bar = Paragraph::new(controls);
     f.render_widget(controls_bar, chunks[3]);
 }
@@ -725,6 +772,36 @@ fn search_rustypipe_continuation(
         ctoken: next_ctoken,
         visitor_data: next_visitor,
         endpoint: next_endpoint,
+    })
+}
+
+fn channel_videos_latest(channel_id: &str) -> Result<SearchPage, String> {
+    let client = rustypipe_client();
+    let runtime = RUNTIME.get_or_init(|| {
+        tokio::runtime::Runtime::new().expect("Failed to create tokio runtime")
+    });
+
+    let result = runtime.block_on(
+        client
+            .query()
+            .channel_videos_order(channel_id, ChannelOrder::Latest),
+    );
+
+    let paginator = match result {
+        Ok(paginator) => paginator,
+        Err(err) => return Err(format!("RustyPipe channel videos failed: {err}")),
+    };
+
+    let mut results = Vec::new();
+    for item in paginator.items {
+        results.push(video_item_to_video(item));
+    }
+
+    Ok(SearchPage {
+        results,
+        ctoken: paginator.ctoken,
+        visitor_data: paginator.visitor_data,
+        endpoint: paginator.endpoint,
     })
 }
 
@@ -835,12 +912,16 @@ fn rustypipe_storage_dir() -> PathBuf {
 }
 
 fn video_item_to_video(video: VideoItem) -> Video {
-    let channel = video.channel.map(|c| c.name);
+    let (channel, channel_id) = match video.channel {
+        Some(channel) => (Some(channel.name), Some(channel.id)),
+        None => (None, None),
+    };
     let thumbnail_url = video.thumbnail.into_iter().next().map(|t| t.url);
     Video {
         title: video.name,
         url: format!("https://www.youtube.com/watch?v={}", video.id),
         channel,
+        channel_id,
         duration: video.duration.map(u64::from),
         view_count: video.view_count,
         publish_date: video.publish_date,

@@ -1,6 +1,6 @@
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -715,7 +715,7 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         controls.push(Span::styled(" q ", Style::default().fg(Color::Cyan)));
         controls.push(Span::raw("Quit"));
         let controls = Line::from(controls);
-        let controls_bar = Paragraph::new(controls);
+        let controls_bar = Paragraph::new(controls).alignment(Alignment::Center);
         f.render_widget(controls_bar, chunks[3]);
     }
 }

@@ -536,7 +536,12 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         }
     };
 
-    let preview_height = 10u16;
+    let inner_height = size.height.saturating_sub(2);
+    let mut preview_height = (inner_height / 3).clamp(4, 14);
+    let max_preview_height = inner_height.saturating_sub(4);
+    if preview_height > max_preview_height {
+        preview_height = max_preview_height;
+    }
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)

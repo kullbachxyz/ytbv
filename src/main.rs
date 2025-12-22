@@ -244,7 +244,7 @@ fn main() -> io::Result<()> {
 fn handle_key(app: &mut App, key: KeyCode) -> io::Result<bool> {
     match key {
         KeyCode::Char('q') => return Ok(true),
-        KeyCode::Tab | KeyCode::BackTab => {
+        KeyCode::Tab => {
             app.focus = match app.focus {
                 Focus::Search => {
                     if app.results.is_empty() {
@@ -256,6 +256,20 @@ fn handle_key(app: &mut App, key: KeyCode) -> io::Result<bool> {
                 }
                 Focus::Results => Focus::Details,
                 Focus::Details => Focus::Search,
+            };
+        }
+        KeyCode::BackTab => {
+            app.focus = match app.focus {
+                Focus::Search => Focus::Details,
+                Focus::Results => Focus::Search,
+                Focus::Details => {
+                    if app.results.is_empty() {
+                        Focus::Search
+                    } else {
+                        sync_selected_result(app);
+                        Focus::Results
+                    }
+                }
             };
         }
         KeyCode::Enter => {
@@ -671,22 +685,28 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     app.thumb_area = thumb_area;
     f.render_widget(preview, text_area);
 
-    let mut controls = vec![];
-    if app.focus == Focus::Results {
-        controls.push(Span::styled(" ⏎ ", Style::default().fg(Color::Cyan)));
-        controls.push(Span::raw("Select/Play "));
+    if app.focus == Focus::Search {
+        f.render_widget(Paragraph::new(""), chunks[3]);
+    } else {
+        let mut controls = vec![];
+        if app.focus == Focus::Results {
+            controls.push(Span::styled(" ↑/↓ ", Style::default().fg(Color::Cyan)));
+            controls.push(Span::raw("Navigate "));
+            controls.push(Span::styled(" ⏎ ", Style::default().fg(Color::Cyan)));
+            controls.push(Span::raw("Select/Play "));
+        }
+        if app.focus == Focus::Details {
+            controls.push(Span::styled(" c ", Style::default().fg(Color::Cyan)));
+            controls.push(Span::raw("Channel videos "));
+        }
+        controls.push(Span::styled(" ↹ ", Style::default().fg(Color::Cyan)));
+        controls.push(Span::raw("Nav "));
+        controls.push(Span::styled(" q ", Style::default().fg(Color::Cyan)));
+        controls.push(Span::raw("Quit"));
+        let controls = Line::from(controls);
+        let controls_bar = Paragraph::new(controls);
+        f.render_widget(controls_bar, chunks[3]);
     }
-    if app.focus == Focus::Details {
-        controls.push(Span::styled(" c ", Style::default().fg(Color::Cyan)));
-        controls.push(Span::raw("Channel videos "));
-    }
-    controls.push(Span::styled(" ↹ ", Style::default().fg(Color::Cyan)));
-    controls.push(Span::raw("Switch "));
-    controls.push(Span::styled(" q ", Style::default().fg(Color::Cyan)));
-    controls.push(Span::raw("Quit"));
-    let controls = Line::from(controls);
-    let controls_bar = Paragraph::new(controls);
-    f.render_widget(controls_bar, chunks[3]);
 }
 
 fn search_rustypipe(query: &str) -> Result<SearchPage, String> {

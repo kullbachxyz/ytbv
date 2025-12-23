@@ -69,6 +69,8 @@ struct App {
     last_thumb: Option<ThumbRender>,
 }
 
+const THUMB_CACHE_MAX_BYTES: u64 = 50 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy)]
 enum ResultsEntry {
     PreviousPage { enabled: bool },
@@ -1045,12 +1047,14 @@ fn download_thumbnail(url: &str) -> Result<PathBuf, String> {
     let filename = safe_filename(url);
     let path = cache_dir.join(filename);
     if path.exists() {
+        let _ = enforce_thumbnail_cache_limit(&cache_dir);
         return Ok(path);
     }
 
     let response = reqwest::blocking::get(url).map_err(|e| format!("Download error: {e}"))?;
     let bytes = response.bytes().map_err(|e| format!("Read error: {e}"))?;
     fs::write(&path, &bytes).map_err(|e| format!("Write error: {e}"))?;
+    let _ = enforce_thumbnail_cache_limit(&cache_dir);
 
     Ok(path)
 }
@@ -1078,6 +1082,38 @@ fn safe_filename(url: &str) -> String {
         name.truncate(max_len);
     }
     format!("{name}.img")
+}
+
+fn enforce_thumbnail_cache_limit(cache_dir: &Path) -> Result<(), String> {
+    let mut entries = Vec::new();
+    let mut total_bytes = 0u64;
+    for entry in fs::read_dir(cache_dir).map_err(|e| format!("Cache read error: {e}"))? {
+        let entry = entry.map_err(|e| format!("Cache read error: {e}"))?;
+        let meta = entry.metadata().map_err(|e| format!("Cache meta error: {e}"))?;
+        if !meta.is_file() {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let size = meta.len();
+        total_bytes = total_bytes.saturating_add(size);
+        entries.push((entry.path(), modified, size));
+    }
+
+    if total_bytes <= THUMB_CACHE_MAX_BYTES {
+        return Ok(());
+    }
+
+    entries.sort_by_key(|(_, modified, _)| *modified);
+    for (path, _, size) in entries {
+        if total_bytes <= THUMB_CACHE_MAX_BYTES {
+            break;
+        }
+        if fs::remove_file(&path).is_ok() {
+            total_bytes = total_bytes.saturating_sub(size);
+        }
+    }
+
+    Ok(())
 }
 
 fn format_duration(secs: u64) -> String {

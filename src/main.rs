@@ -4,14 +4,14 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState,
 };
 use ratatui::Terminal;
 use ratatui::{backend::CrosstermBackend, Frame};
 use rustypipe::client::RustyPipe;
 use rustypipe::model::paginator::ContinuationEndpoint;
-use rustypipe::model::VideoItem;
+use rustypipe::model::{ChannelItem, VideoItem, YouTubeItem};
 use rustypipe::param::{search_filter::SearchFilter, ChannelOrder};
 use std::env;
 use std::fs;
@@ -44,10 +44,23 @@ struct Video {
     thumbnail_loading: bool,
 }
 
+struct Channel {
+    name: String,
+    id: String,
+    handle: Option<String>,
+    subscriber_count: Option<u64>,
+    description: Option<String>,
+}
+
+enum SearchResultItem {
+    Video(Video),
+    Channel(Channel),
+}
+
 struct App {
     query: String,
     cursor: usize,
-    results: Vec<Video>,
+    results: Vec<SearchResultItem>,
     page: usize,
     results_per_page: usize,
     results_view_rows: usize,
@@ -101,7 +114,7 @@ enum AppMsg {
 }
 
 struct SearchPage {
-    results: Vec<Video>,
+    results: Vec<SearchResultItem>,
     ctoken: Option<String>,
     visitor_data: Option<String>,
     endpoint: ContinuationEndpoint,
@@ -217,17 +230,22 @@ fn main() -> io::Result<()> {
                     }
                 }
                 AppMsg::Thumbnail { index, result } => {
-                    if let Some(video) = app.results.get_mut(index) {
-                        video.thumbnail_loading = false;
-                        match result {
-                            Ok(path) => {
-                                video.thumbnail_size = thumbnail_size_from_path(&path);
-                                video.thumbnail_path = Some(path);
-                                app.status = "Thumbnail ready.".to_string();
+                    if let Some(item) = app.results.get_mut(index) {
+                        match item {
+                            SearchResultItem::Video(video) => {
+                                video.thumbnail_loading = false;
+                                match result {
+                                    Ok(path) => {
+                                        video.thumbnail_size = thumbnail_size_from_path(&path);
+                                        video.thumbnail_path = Some(path);
+                                        app.status = "Thumbnail ready.".to_string();
+                                    }
+                                    Err(err) => {
+                                        app.status = err;
+                                    }
+                                }
                             }
-                            Err(err) => {
-                                app.status = err;
-                            }
+                            SearchResultItem::Channel(_) => {}
                         }
                     }
                 }
@@ -333,13 +351,24 @@ fn handle_key(app: &mut App, key: KeyCode) -> io::Result<bool> {
                             }
                         }
                         ResultsEntry::Result(index) => {
-                            if let Some(video) = app.results.get(index) {
-                                match play_video(video) {
-                                    Ok(()) => {
-                                        app.status = format!("Playing: {}", video.title);
-                                    }
-                                    Err(err) => {
-                                        app.status = err;
+                            if let Some(item) = app.results.get(index) {
+                                match item {
+                                    SearchResultItem::Video(video) => match play_video(video) {
+                                        Ok(()) => {
+                                            app.status = format!("Playing: {}", video.title);
+                                        }
+                                        Err(err) => {
+                                            app.status = err;
+                                        }
+                                    },
+                                    SearchResultItem::Channel(channel) => {
+                                        app.query = channel.name.clone();
+                                        app.cursor = app.query.chars().count();
+                                        start_channel_videos(
+                                            app,
+                                            channel.id.clone(),
+                                            channel.name.clone(),
+                                        );
                                     }
                                 }
                             }
@@ -393,16 +422,12 @@ fn handle_key(app: &mut App, key: KeyCode) -> io::Result<bool> {
                 app.query.insert(app.cursor, c);
                 app.cursor += 1;
             } else if c == 'c' && app.focus == Focus::Details {
-                if let Some(video) = app.results.get(app.selected) {
-                    if let Some(channel_id) = video.channel_id.clone() {
-                        let channel_name =
-                            video.channel.clone().unwrap_or_else(|| "Channel".to_string());
-                        app.query = channel_name.clone();
-                        app.cursor = app.query.chars().count();
-                        start_channel_videos(app, channel_id, channel_name);
-                    } else {
-                        app.status = "No channel info for this video.".to_string();
-                    }
+                if let Some((channel_id, channel_name)) = selected_channel_info(app) {
+                    app.query = channel_name.clone();
+                    app.cursor = app.query.chars().count();
+                    start_channel_videos(app, channel_id, channel_name);
+                } else {
+                    app.status = "No channel info for this result.".to_string();
                 }
             }
         }
@@ -623,14 +648,18 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
                 };
                 ListItem::new(Line::from(Span::styled("Next Page", style)))
             }
-            ResultsEntry::Result(index) => {
-                let title = app
-                    .results
-                    .get(index)
-                    .map(|video| video.title.clone())
-                    .unwrap_or_else(|| "-".to_string());
-                ListItem::new(Line::from(Span::raw(title)))
-            }
+            ResultsEntry::Result(index) => match app.results.get(index) {
+                Some(SearchResultItem::Video(video)) => {
+                    ListItem::new(Line::from(Span::raw(video.title.clone())))
+                }
+                Some(SearchResultItem::Channel(channel)) => {
+                    ListItem::new(Line::from(Span::raw(format!(
+                        "[Channel] {}",
+                        channel.name
+                    ))))
+                }
+                None => ListItem::new(Line::from(Span::raw("-"))),
+            },
         })
         .collect();
 
@@ -697,7 +726,7 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     f.render_widget(preview_block, chunks[2]);
 
     let (preview, _) = match app.results.get(app.selected) {
-        Some(video) => {
+        Some(SearchResultItem::Video(video)) => {
             let views = video
                 .view_count
                 .map(format_views)
@@ -729,6 +758,33 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
             ];
             (Paragraph::new(lines.clone()), lines.len())
         }
+        Some(SearchResultItem::Channel(channel)) => {
+            let subs = channel
+                .subscriber_count
+                .map(format_subscribers)
+                .unwrap_or_else(|| "- subscribers".to_string());
+            let handle = channel.handle.clone().unwrap_or_else(|| "-".to_string());
+            let desc = channel
+                .description
+                .clone()
+                .unwrap_or_else(|| "-".to_string());
+            let lines = vec![
+                Line::from(Span::styled(
+                    &channel.name,
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    format!("Handle: {handle}"),
+                    Style::default().fg(Color::Blue),
+                )),
+                Line::from(Span::styled(subs, Style::default().fg(Color::Yellow))),
+                Line::from(Span::styled(
+                    desc,
+                    Style::default().fg(Color::LightMagenta),
+                )),
+            ];
+            (Paragraph::new(lines.clone()), lines.len())
+        }
         None => {
             let lines = vec![Line::from("No results yet.")];
             (Paragraph::new(lines.clone()), lines.len())
@@ -736,7 +792,7 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     };
 
     let (text_area, thumb_area) = match app.results.get(app.selected) {
-        Some(video)
+        Some(SearchResultItem::Video(video))
             if preview_inner.width >= 50
                 && preview_inner.height >= 8
                 && video.thumbnail_path.is_some() =>
@@ -770,6 +826,15 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
 
     app.thumb_area = thumb_area;
     f.render_widget(preview, text_area);
+    if app.thumb_area.is_none() {
+        if let Some(last) = app.last_thumb.as_ref() {
+            f.render_widget(Clear, last.area);
+        }
+    } else if app.thumb_area.is_some() && !selected_has_thumbnail(app) {
+        if let Some(area) = app.thumb_area {
+            f.render_widget(Clear, area);
+        }
+    }
 
     if app.focus == Focus::Search {
         f.render_widget(Paragraph::new(""), chunks[3]);
@@ -781,7 +846,7 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
             controls.push(Span::styled(" ⏎ ", Style::default().fg(Color::Cyan)));
             controls.push(Span::raw("Select/Play "));
         }
-        if app.focus == Focus::Details {
+        if app.focus == Focus::Details && selected_channel_info(app).is_some() {
             controls.push(Span::styled(" c ", Style::default().fg(Color::Cyan)));
             controls.push(Span::raw("Channel videos "));
         }
@@ -801,7 +866,7 @@ fn search_rustypipe(query: &str) -> Result<SearchPage, String> {
         tokio::runtime::Runtime::new().expect("Failed to create tokio runtime")
     });
 
-    let result = runtime.block_on(client.query().search_filter::<VideoItem, _>(
+    let result = runtime.block_on(client.query().search_filter::<YouTubeItem, _>(
         query.to_string(),
         &SearchFilter::new(),
     ));
@@ -814,7 +879,9 @@ fn search_rustypipe(query: &str) -> Result<SearchPage, String> {
     let paginator = response.items;
     let mut results = Vec::new();
     for item in paginator.items {
-        results.push(video_item_to_video(item));
+        if let Some(result) = youtube_item_to_result(item) {
+            results.push(result);
+        }
     }
 
     Ok(SearchPage {
@@ -853,7 +920,7 @@ fn search_rustypipe_continuation(
         let result = runtime.block_on(
             client
                 .query()
-                .continuation::<VideoItem, _>(token, next_endpoint, next_visitor.as_deref()),
+                .continuation::<YouTubeItem, _>(token, next_endpoint, next_visitor.as_deref()),
         );
 
         let paginator = match result {
@@ -862,7 +929,9 @@ fn search_rustypipe_continuation(
         };
 
         for item in paginator.items {
-            results.push(video_item_to_video(item));
+            if let Some(result) = youtube_item_to_result(item) {
+                results.push(result);
+            }
         }
 
         next_ctoken = paginator.ctoken;
@@ -901,7 +970,7 @@ fn channel_videos_latest(channel_id: &str) -> Result<SearchPage, String> {
 
     let mut results = Vec::new();
     for item in paginator.items {
-        results.push(video_item_to_video(item));
+        results.push(SearchResultItem::Video(video_item_to_video(item)));
     }
 
     Ok(SearchPage {
@@ -930,14 +999,17 @@ fn play_video(video: &Video) -> Result<(), String> {
 
 fn queue_thumbnail(app: &mut App, index: usize) {
     let tx = app.tx.clone();
-    let maybe_url = app.results.get_mut(index).and_then(|video| {
-        if video.thumbnail_path.is_none() && !video.thumbnail_loading {
-            if let Some(url) = video.thumbnail_url.clone() {
-                video.thumbnail_loading = true;
-                return Some(url);
+    let maybe_url = app.results.get_mut(index).and_then(|item| match item {
+        SearchResultItem::Video(video) => {
+            if video.thumbnail_path.is_none() && !video.thumbnail_loading {
+                if let Some(url) = video.thumbnail_url.clone() {
+                    video.thumbnail_loading = true;
+                    return Some(url);
+                }
             }
+            None
         }
-        None
+        SearchResultItem::Channel(_) => None,
     });
 
     if let Some(url) = maybe_url {
@@ -957,17 +1029,23 @@ fn render_thumbnail(app: &mut App) -> io::Result<()> {
         }
     };
 
-    let video = match app.results.get(app.selected) {
-        Some(video) => video,
+    let item = match app.results.get(app.selected) {
+        Some(item) => item,
         None => {
             app.last_thumb = None;
             return Ok(());
         }
     };
 
-    let path = match &video.thumbnail_path {
-        Some(path) => path,
-        None => {
+    let path = match item {
+        SearchResultItem::Video(video) => match &video.thumbnail_path {
+            Some(path) => path,
+            None => {
+                app.last_thumb = None;
+                return Ok(());
+            }
+        },
+        SearchResultItem::Channel(_) => {
             app.last_thumb = None;
             return Ok(());
         }
@@ -1037,6 +1115,30 @@ fn video_item_to_video(video: VideoItem) -> Video {
         thumbnail_path: None,
         thumbnail_size: None,
         thumbnail_loading: false,
+    }
+}
+
+fn channel_item_to_channel(channel: ChannelItem) -> Channel {
+    Channel {
+        name: channel.name,
+        id: channel.id,
+        handle: channel.handle,
+        subscriber_count: channel.subscriber_count,
+        description: if channel.short_description.is_empty() {
+            None
+        } else {
+            Some(channel.short_description)
+        },
+    }
+}
+
+fn youtube_item_to_result(item: YouTubeItem) -> Option<SearchResultItem> {
+    match item {
+        YouTubeItem::Video(video) => Some(SearchResultItem::Video(video_item_to_video(video))),
+        YouTubeItem::Channel(channel) => {
+            Some(SearchResultItem::Channel(channel_item_to_channel(channel)))
+        }
+        YouTubeItem::Playlist(_) => None,
     }
 }
 
@@ -1114,6 +1216,27 @@ fn enforce_thumbnail_cache_limit(cache_dir: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn format_subscribers(count: u64) -> String {
+    let (value, suffix) = if count >= 1_000_000_000 {
+        (count as f64 / 1_000_000_000.0, "B")
+    } else if count >= 1_000_000 {
+        (count as f64 / 1_000_000.0, "M")
+    } else if count >= 1_000 {
+        (count as f64 / 1_000.0, "K")
+    } else {
+        return format!("{count} subscribers");
+    };
+
+    let mut s = format!("{value:.2}");
+    while s.ends_with('0') {
+        s.pop();
+    }
+    if s.ends_with('.') {
+        s.pop();
+    }
+    format!("{s}{suffix} subscribers")
 }
 
 fn format_duration(secs: u64) -> String {
@@ -1197,5 +1320,27 @@ fn thumbnail_size_from_path(path: &Path) -> Option<(u32, u32)> {
             Some((size.width as u32, size.height as u32))
         }
         _ => None,
+    }
+}
+
+fn selected_channel_info(app: &App) -> Option<(String, String)> {
+    match app.results.get(app.selected) {
+        Some(SearchResultItem::Video(video)) => {
+            let channel_id = video.channel_id.clone()?;
+            let channel_name = video.channel.clone().unwrap_or_else(|| "Channel".to_string());
+            Some((channel_id, channel_name))
+        }
+        Some(SearchResultItem::Channel(channel)) => {
+            Some((channel.id.clone(), channel.name.clone()))
+        }
+        None => None,
+    }
+}
+
+fn selected_has_thumbnail(app: &App) -> bool {
+    match app.results.get(app.selected) {
+        Some(SearchResultItem::Video(video)) => video.thumbnail_path.is_some(),
+        Some(SearchResultItem::Channel(_)) => false,
+        None => false,
     }
 }

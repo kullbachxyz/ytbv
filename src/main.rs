@@ -49,6 +49,9 @@ struct App {
     cursor: usize,
     results: Vec<Video>,
     page: usize,
+    results_per_page: usize,
+    results_view_rows: usize,
+    results_nav_slots: usize,
     selected_row: usize,
     selected: usize,
     results_state: ListState,
@@ -66,12 +69,10 @@ struct App {
     last_thumb: Option<ThumbRender>,
 }
 
-const RESULTS_PER_PAGE: usize = 17;
-
 #[derive(Debug, Clone, Copy)]
 enum ResultsEntry {
-    PreviousPage,
-    NextPage,
+    PreviousPage { enabled: bool },
+    NextPage { enabled: bool },
     Result(usize),
 }
 
@@ -117,6 +118,9 @@ fn main() -> io::Result<()> {
         cursor: 0,
         results: Vec::new(),
         page: 1,
+        results_per_page: 1,
+        results_view_rows: 0,
+        results_nav_slots: 0,
         selected_row: 0,
         selected: 0,
         results_state: ListState::default(),
@@ -165,7 +169,7 @@ fn main() -> io::Result<()> {
                             app.results = results.results;
                             app.page = 1;
                             app.selected = 0;
-                            app.selected_row = 0;
+                            app.selected_row = first_result_row(&app);
                             app.results_state = ListState::default();
                             app.search_ctoken = results.ctoken;
                             app.search_visitor_data = results.visitor_data;
@@ -197,7 +201,7 @@ fn main() -> io::Result<()> {
                                 app.search_visitor_data = results.visitor_data;
                                 app.search_endpoint = Some(results.endpoint);
                                 if app.pending_next_page
-                                    && app.page < total_pages(app.results.len())
+                                    && app.page < total_pages(app.results.len(), results_page_size(&app))
                                 {
                                     app.page += 1;
                                     app.selected_row = first_result_row(&app);
@@ -285,16 +289,20 @@ fn handle_key(app: &mut App, key: KeyCode) -> io::Result<bool> {
                     }
                     app.selected_row = app.selected_row.min(entries.len().saturating_sub(1));
                     match entries[app.selected_row] {
-                        ResultsEntry::PreviousPage => {
-                            if app.page > 1 {
+                        ResultsEntry::PreviousPage { enabled } => {
+                            if enabled && app.page > 1 {
                                 app.page -= 1;
                                 app.selected_row = first_result_row(app);
                                 app.results_state = ListState::default();
                                 sync_selected_result(app);
                             }
                         }
-                        ResultsEntry::NextPage => {
-                            let loaded_pages = total_pages(app.results.len());
+                        ResultsEntry::NextPage { enabled } => {
+                            if !enabled {
+                                app.status = "No more results.".to_string();
+                                return Ok(false);
+                            }
+                            let loaded_pages = total_pages(app.results.len(), results_page_size(app));
                             if app.page < loaded_pages {
                                 app.page += 1;
                                 app.selected_row = first_result_row(app);
@@ -308,6 +316,7 @@ fn handle_key(app: &mut App, key: KeyCode) -> io::Result<bool> {
                                 let ctoken = app.search_ctoken.clone().unwrap_or_default();
                                 let visitor = app.search_visitor_data.clone();
                                 let endpoint = app.search_endpoint.unwrap_or(ContinuationEndpoint::Search);
+                                let page_size = results_page_size(app);
                                 thread::spawn(move || {
                                     let result = if ctoken.is_empty() {
                                         Err("No more results.".to_string())
@@ -316,6 +325,7 @@ fn handle_key(app: &mut App, key: KeyCode) -> io::Result<bool> {
                                             &ctoken,
                                             visitor.as_deref(),
                                             endpoint,
+                                            page_size,
                                         )
                                     };
                                     let _ = tx.send(AppMsg::MoreResults(result));
@@ -404,44 +414,65 @@ fn handle_key(app: &mut App, key: KeyCode) -> io::Result<bool> {
     Ok(false)
 }
 
-fn total_pages(result_count: usize) -> usize {
+fn total_pages(result_count: usize, per_page: usize) -> usize {
+    let per_page = per_page.max(1);
     if result_count == 0 {
         1
     } else {
-        (result_count + RESULTS_PER_PAGE - 1) / RESULTS_PER_PAGE
+        (result_count + per_page - 1) / per_page
     }
 }
 
 fn first_result_row(app: &App) -> usize {
-    if app.page > 1 {
-        1
+    let entries = results_entries(app);
+    for (idx, entry) in entries.iter().enumerate() {
+        if matches!(entry, ResultsEntry::Result(_)) {
+            return idx;
+        }
+    }
+    0
+}
+
+fn update_results_layout(app: &mut App, view_rows: usize) {
+    app.results_view_rows = view_rows;
+    if view_rows >= 3 {
+        app.results_nav_slots = 2;
+        app.results_per_page = view_rows.saturating_sub(2);
     } else {
-        0
+        app.results_nav_slots = 0;
+        app.results_per_page = view_rows;
     }
 }
 
+fn results_page_size(app: &App) -> usize {
+    app.results_per_page.max(1)
+}
+
 fn results_entries(app: &App) -> Vec<ResultsEntry> {
-    let total = total_pages(app.results.len());
-    if app.results.is_empty() {
+    if app.results.is_empty() || app.results_view_rows == 0 {
         return Vec::new();
     }
+    let per_page = results_page_size(app);
+    let total = total_pages(app.results.len(), per_page);
 
     let page = app.page.clamp(1, total);
-    let start = (page - 1) * RESULTS_PER_PAGE;
-    let end = (start + RESULTS_PER_PAGE).min(app.results.len());
+    let start = (page - 1) * per_page;
+    let end = (start + per_page).min(app.results.len());
     let mut entries = Vec::new();
     let has_more = app.search_ctoken.is_some() || app.loading_more;
+    let has_prev = page > 1;
+    let has_next = page < total || has_more;
 
-    if page > 1 {
-        entries.push(ResultsEntry::PreviousPage);
+    if app.results_nav_slots >= 1 {
+        entries.push(ResultsEntry::PreviousPage { enabled: has_prev });
     }
 
     for index in start..end {
         entries.push(ResultsEntry::Result(index));
     }
 
-    if page > 1 || page < total || has_more {
-        entries.push(ResultsEntry::NextPage);
+    if app.results_nav_slots >= 2 {
+        entries.push(ResultsEntry::NextPage { enabled: has_next });
     }
 
     entries
@@ -490,45 +521,6 @@ fn start_channel_videos(app: &mut App, channel_id: String, channel_name: String)
 fn ui(f: &mut Frame<'_>, app: &mut App) {
     let size = f.size();
 
-    let (preview, _) = match app.results.get(app.selected) {
-        Some(video) => {
-            let views = video
-                .view_count
-                .map(format_views)
-                .unwrap_or_else(|| "- views".to_string());
-            let duration = video
-                .duration
-                .map(format_duration)
-                .unwrap_or_else(|| "-".to_string());
-            let uploader = video.channel.clone().unwrap_or_else(|| "-".to_string());
-            let published = format_published(video.publish_date_txt.as_deref(), video.publish_date);
-            let lines = vec![
-                Line::from(Span::styled(
-                    &video.title,
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled(views, Style::default().fg(Color::Yellow))),
-                Line::from(Span::styled(
-                    format!("Length: {duration}"),
-                    Style::default().fg(Color::Green),
-                )),
-                Line::from(Span::styled(
-                    format!("Uploaded by {uploader}"),
-                    Style::default().fg(Color::Blue),
-                )),
-                Line::from(Span::styled(
-                    published,
-                    Style::default().fg(Color::LightMagenta),
-                )),
-            ];
-            (Paragraph::new(lines.clone()), lines.len())
-        }
-        None => {
-            let lines = vec![Line::from("No results yet.")];
-            (Paragraph::new(lines.clone()), lines.len())
-        }
-    };
-
     let inner_height = size.height.saturating_sub(2);
     let mut preview_height = (inner_height / 3).clamp(4, 14);
     let max_preview_height = inner_height.saturating_sub(4);
@@ -573,19 +565,29 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
             Focus::Search | Focus::Details => Style::default(),
         });
     f.render_widget(results_block.clone(), chunks[1]);
+    let inner = results_block.inner(chunks[1]);
+    update_results_layout(app, inner.height as usize);
 
     let entries = results_entries(app);
     let items: Vec<ListItem> = entries
         .iter()
         .map(|entry| match *entry {
-            ResultsEntry::PreviousPage => ListItem::new(Line::from(Span::styled(
-                "Previous Page",
-                Style::default().fg(Color::Cyan),
-            ))),
-            ResultsEntry::NextPage => ListItem::new(Line::from(Span::styled(
-                "Next Page",
-                Style::default().fg(Color::Cyan),
-            ))),
+            ResultsEntry::PreviousPage { enabled } => {
+                let style = if enabled {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                ListItem::new(Line::from(Span::styled("Previous Page", style)))
+            }
+            ResultsEntry::NextPage { enabled } => {
+                let style = if enabled {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                ListItem::new(Line::from(Span::styled("Next Page", style)))
+            }
             ResultsEntry::Result(index) => {
                 let title = app
                     .results
@@ -605,7 +607,6 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         app.results_state.select(Some(app.selected_row));
     }
 
-    let inner = results_block.inner(chunks[1]);
     let show_scrollbar = inner.height > 0 && items.len() > inner.height as usize;
     let (list_area, scrollbar_area) = if show_scrollbar && inner.width > 1 {
         (
@@ -659,6 +660,45 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         });
     let preview_inner = preview_block.inner(chunks[2]);
     f.render_widget(preview_block, chunks[2]);
+
+    let (preview, _) = match app.results.get(app.selected) {
+        Some(video) => {
+            let views = video
+                .view_count
+                .map(format_views)
+                .unwrap_or_else(|| "- views".to_string());
+            let duration = video
+                .duration
+                .map(format_duration)
+                .unwrap_or_else(|| "-".to_string());
+            let uploader = video.channel.clone().unwrap_or_else(|| "-".to_string());
+            let published = format_published(video.publish_date_txt.as_deref(), video.publish_date);
+            let lines = vec![
+                Line::from(Span::styled(
+                    &video.title,
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(views, Style::default().fg(Color::Yellow))),
+                Line::from(Span::styled(
+                    format!("Length: {duration}"),
+                    Style::default().fg(Color::Green),
+                )),
+                Line::from(Span::styled(
+                    format!("Uploaded by {uploader}"),
+                    Style::default().fg(Color::Blue),
+                )),
+                Line::from(Span::styled(
+                    published,
+                    Style::default().fg(Color::LightMagenta),
+                )),
+            ];
+            (Paragraph::new(lines.clone()), lines.len())
+        }
+        None => {
+            let lines = vec![Line::from("No results yet.")];
+            (Paragraph::new(lines.clone()), lines.len())
+        }
+    };
 
     let (text_area, thumb_area) = match app.results.get(app.selected) {
         Some(video)
@@ -754,6 +794,7 @@ fn search_rustypipe_continuation(
     ctoken: &str,
     visitor_data: Option<&str>,
     endpoint: ContinuationEndpoint,
+    target_count: usize,
 ) -> Result<SearchPage, String> {
     let client = rustypipe_client();
     let runtime = RUNTIME.get_or_init(|| {
@@ -770,7 +811,7 @@ fn search_rustypipe_continuation(
     let mut next_endpoint = endpoint;
     let mut pages_fetched = 0usize;
 
-    while results.len() < RESULTS_PER_PAGE {
+    while target_count > 0 && results.len() < target_count {
         let Some(token) = next_ctoken.clone() else {
             break;
         };

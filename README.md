@@ -68,6 +68,31 @@ cargo build --release
 sudo cp target/release/ytbv /usr/local/bin/
 ```
 
+### macOS build notes (sixel support)
+
+`viuer`/`sixel` needs native image libs present. On macOS install and export paths before building:
+
+```bash
+brew install libsixel jpeg libpng giflib
+
+export PKG_CONFIG_PATH="/opt/homebrew/lib/pkgconfig:${PKG_CONFIG_PATH}"
+export CPATH="/opt/homebrew/include:${CPATH}"
+export LIBRARY_PATH="/opt/homebrew/lib:${LIBRARY_PATH}"
+
+# If a previous build failed on sixel-sys, clear it:
+cargo clean -p sixel-sys
+```
+
+### macOS playback notes (mpv + yt-dlp)
+
+- Install mpv + yt-dlp (Homebrew): `brew install mpv yt-dlp` (or `brew install --cask mpv` for the app bundle).
+- If using the .app bundle, point ytbv at it and ensure mpv sees Homebrew's PATH/yt-dlp. The usual setup is:
+
+```bash
+export PATH="/opt/homebrew/bin:$PATH"
+export YTBV_MPV=/Applications/mpv.app/Contents/MacOS/mpv
+```
+
 ## Next Steps
 
 - Improve thumbnail rendering quality and fallbacks.

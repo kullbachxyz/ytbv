@@ -59,7 +59,7 @@ struct App {
     search_visitor_data: Option<String>,
     search_endpoint: Option<ContinuationEndpoint>,
     loading_more: bool,
-    pending_next_page: bool,
+    pending_next_target: Option<usize>,
     status: String,
     rx: Receiver<AppMsg>,
     tx: Sender<AppMsg>,
@@ -128,7 +128,7 @@ fn main() -> io::Result<()> {
         search_visitor_data: None,
         search_endpoint: None,
         loading_more: false,
-        pending_next_page: false,
+        pending_next_target: None,
         status: "Type a query and press Enter.".to_string(),
         rx,
         tx,
@@ -175,7 +175,7 @@ fn main() -> io::Result<()> {
                             app.search_visitor_data = results.visitor_data;
                             app.search_endpoint = Some(results.endpoint);
                             app.loading_more = false;
-                            app.pending_next_page = false;
+                            app.pending_next_target = None;
                             if !app.results.is_empty() {
                                 app.focus = Focus::Results;
                                 let selected = app.selected;
@@ -193,28 +193,23 @@ fn main() -> io::Result<()> {
                     match result {
                         Ok(results) => {
                             if results.results.is_empty() {
-                                app.pending_next_page = false;
+                                app.pending_next_target = None;
                                 app.status = "No more results.".to_string();
                             } else {
                                 app.results.extend(results.results);
                                 app.search_ctoken = results.ctoken;
                                 app.search_visitor_data = results.visitor_data;
                                 app.search_endpoint = Some(results.endpoint);
-                                if app.pending_next_page
-                                    && app.page < total_pages(app.results.len(), results_page_size(&app))
-                                {
-                                    app.page += 1;
-                                    app.selected_row = first_result_row(&app);
-                                    app.results_state = ListState::default();
-                                    sync_selected_result(&mut app);
+                                if app.pending_next_target.is_some() {
+                                    maybe_advance_pending_page(&mut app);
+                                } else {
+                                    app.status =
+                                        format!("Found {} results.", app.results.len());
                                 }
-                                app.pending_next_page = false;
-                                app.status =
-                                    format!("Found {} results.", app.results.len());
                             }
                         }
                         Err(err) => {
-                            app.pending_next_page = false;
+                            app.pending_next_target = None;
                             app.status = err;
                         }
                     }
@@ -302,21 +297,22 @@ fn handle_key(app: &mut App, key: KeyCode) -> io::Result<bool> {
                                 app.status = "No more results.".to_string();
                                 return Ok(false);
                             }
-                            let loaded_pages = total_pages(app.results.len(), results_page_size(app));
-                            if app.page < loaded_pages {
+                            let per_page = results_page_size(app);
+                            let desired_count = (app.page + 1).saturating_mul(per_page);
+                            if app.results.len() >= desired_count {
                                 app.page += 1;
                                 app.selected_row = first_result_row(app);
                                 app.results_state = ListState::default();
                                 sync_selected_result(app);
                             } else if app.search_ctoken.is_some() && !app.loading_more {
                                 app.loading_more = true;
-                                app.pending_next_page = true;
+                                app.pending_next_target = Some(desired_count);
                                 app.status = "Loading more results...".to_string();
                                 let tx = app.tx.clone();
                                 let ctoken = app.search_ctoken.clone().unwrap_or_default();
                                 let visitor = app.search_visitor_data.clone();
                                 let endpoint = app.search_endpoint.unwrap_or(ContinuationEndpoint::Search);
-                                let page_size = results_page_size(app);
+                                let target_count = desired_count.saturating_sub(app.results.len());
                                 thread::spawn(move || {
                                     let result = if ctoken.is_empty() {
                                         Err("No more results.".to_string())
@@ -325,7 +321,7 @@ fn handle_key(app: &mut App, key: KeyCode) -> io::Result<bool> {
                                             &ctoken,
                                             visitor.as_deref(),
                                             endpoint,
-                                            page_size,
+                                            target_count,
                                         )
                                     };
                                     let _ = tx.send(AppMsg::MoreResults(result));
@@ -489,6 +485,43 @@ fn sync_selected_result(app: &mut App) {
             app.selected = index;
             queue_thumbnail(app, index);
         }
+    }
+}
+
+fn maybe_advance_pending_page(app: &mut App) {
+    let Some(target) = app.pending_next_target else {
+        return;
+    };
+
+    if app.results.len() >= target {
+        app.page += 1;
+        app.selected_row = first_result_row(app);
+        app.results_state = ListState::default();
+        sync_selected_result(app);
+        app.pending_next_target = None;
+        app.status = format!("Found {} results.", app.results.len());
+        return;
+    }
+
+    if app.search_ctoken.is_some() && !app.loading_more {
+        app.loading_more = true;
+        app.status = "Loading more results...".to_string();
+        let tx = app.tx.clone();
+        let ctoken = app.search_ctoken.clone().unwrap_or_default();
+        let visitor = app.search_visitor_data.clone();
+        let endpoint = app.search_endpoint.unwrap_or(ContinuationEndpoint::Search);
+        let target_count = target.saturating_sub(app.results.len());
+        thread::spawn(move || {
+            let result = if ctoken.is_empty() {
+                Err("No more results.".to_string())
+            } else {
+                search_rustypipe_continuation(&ctoken, visitor.as_deref(), endpoint, target_count)
+            };
+            let _ = tx.send(AppMsg::MoreResults(result));
+        });
+    } else {
+        app.pending_next_target = None;
+        app.status = "No more results.".to_string();
     }
 }
 
